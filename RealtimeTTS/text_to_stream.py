@@ -497,9 +497,20 @@ class TextToAudioStream:
 
                 def synthesize_worker():
                     nonlocal sentence_count
+                    # Use a timeout on get() so the worker can wake up and
+                    # observe abort_event being set even when the queue is empty.
                     while not abort_event.is_set():
-                        sentence = sentence_queue.get()
+                        try:
+                            sentence = sentence_queue.get(timeout=0.2)
+                        except queue.Empty:
+                            # No sentence available, loop and check abort_event
+                            continue
+
                         if sentence is None:  # Sentinel value to stop the worker
+                            try:
+                                sentence_queue.task_done()
+                            except Exception:
+                                pass
                             break
 
                         sentence_count += 1
@@ -578,7 +589,10 @@ class TextToAudioStream:
                                     self.player.start()
                                     self.player.on_audio_chunk = self._on_audio_chunk
 
-                        sentence_queue.task_done()
+                        try:
+                            sentence_queue.task_done()
+                        except Exception:
+                            pass
 
                 worker_thread = threading.Thread(target=synthesize_worker)
                 worker_thread.daemon = True
@@ -596,7 +610,10 @@ class TextToAudioStream:
 
                 # Signal to the worker to stop
                 sentence_queue.put(None)
-                worker_thread.join()
+                # Wait for worker to finish but don't block forever
+                worker_thread.join(timeout=30.0)
+                if worker_thread.is_alive():
+                    logging.warning("synthesize_worker did not exit within timeout, continuing shutdown")
 
             except Exception as e:
                 self.error_flag = True

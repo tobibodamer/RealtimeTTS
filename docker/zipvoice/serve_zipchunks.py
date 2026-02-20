@@ -13,6 +13,7 @@ Features:
 """
 from __future__ import annotations
 
+import logging
 import os
 import queue
 import threading
@@ -34,17 +35,12 @@ VOICE_ALPHA_PROMPT_TEXT = os.getenv(
     "VOICE_ALPHA_PROMPT_TEXT",
     "Hi there! I'm really excited to try this out! I hope the speech sounds natural and warm - that's exactly what I'm going for!"
 )
-VOICE_BETA_WAV_PATH = os.getenv("VOICE_BETA_WAV_PATH", "reference2.wav")
-VOICE_BETA_PROMPT_TEXT = os.getenv(
-    "VOICE_BETA_PROMPT_TEXT",
-    "Your voice just got supercharged! Crystal clear audio that flows like silk and hits like thunder!"
-)
+
 
 # --- Global State ---
 # These will be initialized during the application lifespan startup.
 engine: ZipVoiceEngine | None = None
 stream: TextToAudioStream | None = None
-AVAILABLE_VOICES: Dict[str, ZipVoiceVoice] = {}
 
 # A semaphore to ensure only one TTS synthesis runs at a time, preventing GPU overload.
 tts_semaphore = threading.Semaphore(1)
@@ -118,7 +114,7 @@ async def lifespan(app: FastAPI):
     """
     Manages the startup and shutdown of the TTS engine.
     """
-    global engine, stream, AVAILABLE_VOICES
+    global engine, stream
 
     print("--- Server Starting Up ---")
 
@@ -127,39 +123,20 @@ async def lifespan(app: FastAPI):
             "The 'ZIPVOICE_PROJECT_ROOT' environment variable is not set or is not a valid directory."
         )
 
-    # 1. Create the ZipVoiceVoice objects from the configured paths and text.
-    print("Loading voice prompts...")
-    try:
-        voice_alpha = ZipVoiceVoice(
-            prompt_wav_path=VOICE_ALPHA_WAV_PATH,
-            prompt_text=VOICE_ALPHA_PROMPT_TEXT
-        )
-        voice_beta = ZipVoiceVoice(
-            prompt_wav_path=VOICE_BETA_WAV_PATH,
-            prompt_text=VOICE_BETA_PROMPT_TEXT
-        )
-        AVAILABLE_VOICES = {
-            "alpha-warm": voice_alpha,
-            "beta-intense": voice_beta,
-        }
-        print(f"Loaded {len(AVAILABLE_VOICES)} voices: {list(AVAILABLE_VOICES.keys())}")
-    except FileNotFoundError as e:
-        raise RuntimeError(f"Could not find a voice prompt file: {e}. Make sure paths are correct.")
-
-
-    # 2. Initialize the ZipVoiceEngine with the first voice as the default.
+    # Initialize the ZipVoiceEngine with a dummy voice (will be replaced per request)
     print("Initializing ZipVoiceEngine...")
+    dummy_voice = ZipVoiceVoice(prompt_wav_path=VOICE_ALPHA_WAV_PATH, prompt_text=VOICE_ALPHA_PROMPT_TEXT)
     engine = ZipVoiceEngine(
         zipvoice_root=ZIPVOICE_PROJECT_ROOT,
-        voice=voice_alpha,
+        voice=dummy_voice,
         model_name="zipvoice",
         device="cuda" if "cuda" in os.getenv("DEVICE", "cuda") else "cpu" # Prefer CUDA
     )
 
-    # 3. Create the TextToAudioStream.
-    stream = TextToAudioStream(engine, muted=True)
+    # Create the TextToAudioStream.
+    stream = TextToAudioStream(engine, muted=True, level=logging.DEBUG)
 
-    # 4. Warm up the engine to reduce latency on the first request.
+    # Warm up the engine to reduce latency on the first request.
     print("Warming up the engine...")
     stream.feed("Server is now ready.").play(muted=True)
 
@@ -178,10 +155,46 @@ async def lifespan(app: FastAPI):
 # --- FastAPI App and Endpoint ---
 app = FastAPI(lifespan=lifespan)
 
+
+
+# Simple in-memory cache for ZipVoiceVoice objects
+_voice_cache = {}
+
+
+def _list_voices_from_fs(voices_dir: str) -> Dict[str, Dict]:
+    """
+    Return a mapping of voice_name -> metadata found in the voices directory.
+    The metadata currently includes whether the required files exist and a short
+    preview of the prompt text if available.
+    """
+    voices = {}
+    try:
+        if os.path.isdir(voices_dir):
+            for fname in os.listdir(voices_dir):
+                if not fname.lower().endswith(".wav"):
+                    continue
+                name = os.path.splitext(fname)[0]
+                wav_path = os.path.join(voices_dir, f"{name}.wav")
+                txt_path = os.path.join(voices_dir, f"{name}.txt")
+                exists = os.path.isfile(wav_path) and os.path.isfile(txt_path)
+                preview = None
+                if os.path.isfile(txt_path):
+                    try:
+                        with open(txt_path, "r", encoding="utf-8") as f:
+                            preview = f.read(200).strip()
+                    except Exception:
+                        preview = None
+                voices[name] = {"exists": exists, "preview": preview}
+    except Exception:
+        # On any error, return what we have so far (or empty dict).
+        pass
+    return voices
+
 @app.post("/api/c3BlZWNo")
 async def create_speech(request: TTSRequest):
     """
     Accepts text and a voice name, and streams back raw PCM audio.
+    Loads the requested voice from /opt/app-root/voices on-demand, with caching.
     """
     # 1. Check if the TTS engine is busy. If so, reject the request immediately.
     if not tts_semaphore.acquire(blocking=False):
@@ -192,20 +205,30 @@ async def create_speech(request: TTSRequest):
             headers={"Retry-After": "5"}
         )
 
-    # 2. Validate the requested voice.
-    selected_voice = AVAILABLE_VOICES.get(request.voice)
-    if not selected_voice:
-        tts_semaphore.release()  # Release the lock before raising the error
-        raise HTTPException(
-            status_code=404,
-            detail=f"Voice '{request.voice}' not found. Available voices: {list(AVAILABLE_VOICES.keys())}"
-        )
+    # 2. Load the requested voice from cache or disk
+    voice_name = request.voice
+    voices_dir = "/opt/app-root/voices"
+    if voice_name in _voice_cache:
+        selected_voice = _voice_cache[voice_name]
+    else:
+        wav_path = os.path.join(voices_dir, f"{voice_name}.wav")
+        txt_path = os.path.join(voices_dir, f"{voice_name}.txt")
+        if not os.path.isfile(wav_path) or not os.path.isfile(txt_path):
+            tts_semaphore.release()
+            raise HTTPException(
+                status_code=404,
+                detail=f"Voice '{voice_name}' not found in {voices_dir}. Ensure both {voice_name}.wav and {voice_name}.txt exist."
+            )
+        with open(txt_path, "r", encoding="utf-8") as f:
+            prompt_text = f.read().strip()
+        selected_voice = ZipVoiceVoice(prompt_wav_path=wav_path, prompt_text=prompt_text)
+        _voice_cache[voice_name] = selected_voice
 
     # 3. Create a queue to pass audio data from the processing thread to this endpoint.
     audio_queue = queue.Queue()
 
     # 4. Start the TTS processing in a separate thread.
-    print(f"Received request for voice '{request.voice}'. Starting processing thread.")
+    print(f"Received request for voice '{voice_name}'. Starting processing thread.")
     threading.Thread(
         target=process_tts_request,
         args=(request.text, selected_voice, audio_queue),
@@ -218,6 +241,38 @@ async def create_speech(request: TTSRequest):
         audio_chunk_generator(audio_queue),
         media_type="audio/pcm; rate=24000; bit-depth=16; channels=1"
     )
+
+
+@app.get("/api/voices")
+async def list_voices():
+    """Return a JSON object with all available voices.
+
+    This merges voices discovered on disk under `/opt/app-root/voices` with
+    any voices stored in the in-memory cache `_voice_cache`.
+    """
+    voices_dir = "/opt/app-root/voices"
+
+    # 1) Voices from filesystem
+    fs_voices = _list_voices_from_fs(voices_dir)
+
+    # 2) Voices from cache
+    cache_voices = {}
+    for name, v in _voice_cache.items():
+        # ZipVoiceVoice stores prompt_wav_path and prompt_text; provide a small preview
+        preview = None
+        try:
+            if getattr(v, "prompt_text", None):
+                preview = str(v.prompt_text)[:200]
+        except Exception:
+            preview = None
+        cache_voices[name] = {"exists": True, "preview": preview}
+
+    # 3) Merge (cache overrides filesystem entries)
+    merged = fs_voices.copy()
+    merged.update(cache_voices)
+
+    # 4) Return as a simple mapping name -> metadata
+    return {"voices": merged}
 
 
 # --- Main Guard ---

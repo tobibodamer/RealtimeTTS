@@ -1,0 +1,17 @@
+services:
+  zipvoice-server:
+    build:
+      context: ../../
+      dockerfile: docker/zipvoice/Dockerfile
+    ports:
+      - "9086:9086"
+    volumes:
+      - "./docker-cache:/opt/app-root/cache/"
+      - "./voices:/opt/app-root/voices/"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
